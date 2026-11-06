@@ -19,6 +19,17 @@ void godror_setFromString(dpiVar *dv, uint32_t pos, const _GoString_ value) {
 	dpiVar_setFromBytes(dv, pos, _GoStringPtr(value), length);
 }
 
+void godror_setFromBuffer(dpiVar *dv, const char *buf, const uint32_t *lengths, uint32_t n) {
+	uint32_t i;
+	for( i = 0; i < n; i++ ) {
+		if( lengths[i] == 0 ) {
+			continue;
+		}
+		dpiVar_setFromBytes(dv, i, buf, lengths[i]);
+		buf += lengths[i];
+	}
+}
+
 dpiAnnotation godror_getAnnotation(dpiAnnotation *annotations, int32_t idx) {
 	return annotations[idx];
 }
@@ -72,6 +83,7 @@ type stmtOptions struct {
 	warningAsError     bool
 	noRetry            bool
 	jsonAsString       bool
+	bindTimeAsDate     bool
 }
 
 type boolString struct {
@@ -287,6 +299,11 @@ func CallTimeout(d time.Duration) Option {
 // NullDateAsZeroTime is an option to return NULL DATE columns as time.Time{} instead of nil.
 // If you must Scan into time.Time (cannot use sql.NullTime), this may help.
 func NullDateAsZeroTime() Option { return func(o *stmtOptions) { o.nullDateAsZeroTime = true } }
+
+// BindTimeAsDate is an option to bind time.Time input values as DATE instead of TIMESTAMP WITH TIME ZONE.
+// The value is converted to the connection's timezone as usual; fractional seconds are dropped.
+// Binding as DATE avoids the per-value timezone construction, which is much cheaper for array DML into DATE columns.
+func BindTimeAsDate() Option { return func(o *stmtOptions) { o.bindTimeAsDate = true } }
 
 // DeleteFromCache is an option to delete the statement from the statement cache.
 func DeleteFromCache() Option { return func(o *stmtOptions) { o.deleteFromCache = true } }
@@ -1440,6 +1457,9 @@ func (st *statement) bindVarTypeSwitch(ctx context.Context, info *argInfo, get *
 
 	case time.Time, NullTime, *timestamppb.Timestamp:
 		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_TIMESTAMP_TZ, C.DPI_NATIVE_TYPE_TIMESTAMP
+		if st.bindTimeAsDate && !info.isOut {
+			info.typ = C.DPI_ORACLE_TYPE_DATE
+		}
 		info.set = st.conn.dataSetTime
 		if info.isOut {
 			*get = st.conn.dataGetTime
@@ -1447,7 +1467,7 @@ func (st *statement) bindVarTypeSwitch(ctx context.Context, info *argInfo, get *
 
 	case []time.Time, []NullTime, []*timestamppb.Timestamp:
 		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_TIMESTAMP_TZ, C.DPI_NATIVE_TYPE_TIMESTAMP
-		if st.plSQLArrays {
+		if st.plSQLArrays || (st.bindTimeAsDate && !info.isOut) {
 			info.typ = C.DPI_ORACLE_TYPE_DATE
 		}
 		info.set = st.conn.dataSetTime
@@ -2584,16 +2604,7 @@ func dataSetBytes(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv any) e
 		//if logger != nil {Log("C", "dpiVar_setFromBytes", "dv", dv, "pos", pos, "p", p, "len", len(x)) }
 		C.dpiVar_setFromBytes(dv, C.uint32_t(i), p, C.uint32_t(len(x)))
 	case [][]byte:
-		for i, x := range slice {
-			if len(x) == 0 {
-				data[i].isNull = 1
-				continue
-			}
-			data[i].isNull = 0
-			p = (*C.char)(unsafe.Pointer(&x[0]))
-			//if logger != nil {Log("C", "dpiVar_setFromBytes", "dv", dv, "pos", pos, "p", p, "len", len(x)) }
-			C.dpiVar_setFromBytes(dv, C.uint32_t(i), p, C.uint32_t(len(x)))
-		}
+		dpiSetFromSlice(dv, data, slice)
 
 	case Number:
 		i, x := 0, slice
@@ -2604,14 +2615,7 @@ func dataSetBytes(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv any) e
 		data[i].isNull = 0
 		dpiSetFromString(dv, C.uint32_t(i), string(x))
 	case []Number:
-		for i, x := range slice {
-			if len(x) == 0 {
-				data[i].isNull = 1
-				continue
-			}
-			data[i].isNull = 0
-			dpiSetFromString(dv, C.uint32_t(i), string(x))
-		}
+		dpiSetFromSlice(dv, data, slice)
 
 	case decimalDecompose:
 		i, x := 0, slice
@@ -2649,14 +2653,7 @@ func dataSetBytes(ctx context.Context, dv *C.dpiVar, data []C.dpiData, vv any) e
 		data[i].isNull = 0
 		dpiSetFromString(dv, C.uint32_t(i), x)
 	case []string:
-		for i, x := range slice {
-			if len(x) == 0 {
-				data[i].isNull = 1
-				continue
-			}
-			data[i].isNull = 0
-			dpiSetFromString(dv, C.uint32_t(i), x)
-		}
+		dpiSetFromSlice(dv, data, slice)
 
 	default:
 		return fmt.Errorf("awaited [][]byte/[]string/[]Number, got %T (%#v)", vv, vv)
@@ -3579,6 +3576,30 @@ func (da *DomainAnnotation) init(ti C.dpiDataTypeInfo) {
 
 func dpiSetFromString(dv *C.dpiVar, pos C.uint32_t, x string) {
 	C.godror_setFromString(dv, pos, x)
+}
+
+func dpiSetFromSlice[T ~string | ~[]byte](dv *C.dpiVar, data []C.dpiData, values []T) {
+	if len(values) == 0 {
+		return
+	}
+	var total int
+	for _, x := range values {
+		total += len(x)
+	}
+	if total == 0 {
+		for i := range values {
+			data[i].isNull = 1
+		}
+		return
+	}
+	buf := make([]byte, 0, total)
+	lengths := make([]C.uint32_t, len(values))
+	for i, x := range values {
+		data[i].isNull = C.int(b2i(len(x) == 0))
+		lengths[i] = C.uint32_t(len(x))
+		buf = append(buf, x...)
+	}
+	C.godror_setFromBuffer(dv, (*C.char)(unsafe.Pointer(&buf[0])), &lengths[0], C.uint32_t(len(values)))
 }
 
 var stringBuilders = stringBuilderPool{
